@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""clm - Claude Code Model Selector. TUI with curses, zero dependencies."""
+
+import curses
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+
+SLOTS = [
+    ("model",   "model",                           "Main Model",    None),
+    ("opus",    "ANTHROPIC_DEFAULT_OPUS_MODEL",    "Opus Default",  "env"),
+    ("sonnet",  "ANTHROPIC_DEFAULT_SONNET_MODEL",  "Sonnet Default","env"),
+    ("haiku",   "ANTHROPIC_DEFAULT_HAIKU_MODEL",   "Haiku Default", "env"),
+]
+
+PROVIDER_NAMES = {
+    "combo": "Combo", "free": "Free", "glm": "GLM", "cx": "CX/GPT",
+    "gc": "GC/Gemini", "qw": "Qwen", "cu": "CU", "cl": "CL",
+    "gh": "GH", "kimi": "Kimi", "kr": "KR", "openrouter": "OpenRouter",
+    "cc": "CC/Claude", "nvidia": "NVIDIA", "ollama": "Ollama", "ag": "AG",
+}
+
+SKIP = ("openrouter/openai/text-embedding", "openrouter/qwen/qwen3-embedding",
+        "openrouter/perplexity/pplx-embed", "openrouter/nvidia/llama-nemotron-embed",
+        "openrouter/openai/tts-", "openrouter/openai/gpt-4o-mini-tts")
+
+
+# ── Settings helpers ──────────────────────────────────────────────
+
+def load():
+    with open(SETTINGS_PATH) as f:
+        return json.load(f)
+
+def save(s):
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(s, f, indent=2)
+        f.write("\n")
+
+def get_val(s, idx):
+    _, key, _, env_key = SLOTS[idx]
+    if env_key:
+        return s.get(env_key, {}).get(key, "")
+    return s.get(key, "")
+
+def set_val(s, idx, val):
+    _, key, _, env_key = SLOTS[idx]
+    if env_key:
+        s.setdefault(env_key, {})[key] = val
+    else:
+        s[key] = val
+
+
+# ── API ───────────────────────────────────────────────────────────
+
+def fetch_models(s):
+    """Fetch model list from API via curl subprocess.
+
+    Uses curl instead of urllib because PyInstaller bundles its own
+    libssl.so which conflicts with system OpenSSL (wrong version) and
+    lacks CA certificates.  Curl uses system libraries and certs.
+    LD_LIBRARY_PATH is stripped so the PyInstaller temp dir's libssl
+    doesn't override the system one that libcurl links against.
+    """
+    base = s.get("env", {}).get("ANTHROPIC_BASE_URL", "")
+    token = s.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    if not base or not token:
+        return None
+    curl = shutil.which("curl")
+    if not curl:
+        return None
+    url = f"{base.rstrip('/')}/models"
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("DYLD_LIBRARY_PATH", None)
+    try:
+        r = subprocess.run(
+            [curl, "-fsSL", "--max-time", "15",
+             "-H", f"Authorization: Bearer {token}",
+             "-H", "Content-Type: application/json",
+             url],
+            capture_output=True, text=True, timeout=20, env=env)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+    except Exception:
+        return None
+    models = [m["id"] for m in data.get("data", [])]
+    return sorted(m for m in models if not any(m.startswith(p) for p in SKIP))
+
+
+# ── Group by provider ─────────────────────────────────────────────
+
+def group_models(models):
+    groups = []
+    seen = {}
+    for m in models:
+        prefix = m.split("/")[0] if "/" in m else "other"
+        if prefix not in seen:
+            seen[prefix] = len(groups)
+            name = PROVIDER_NAMES.get(prefix, prefix.upper())
+            groups.append((f"{name} ({prefix}/)", []))
+        groups[seen[prefix]][1].append(m)
+    return groups
+
+
+# ── TUI ───────────────────────────────────────────────────────────
+
+# Colors
+C_TITLE = 1
+C_HEADER = 2
+C_CURRENT = 3
+C_SELECTED = 4
+C_HINT = 5
+C_ERROR = 6
+C_NORMAL = 7
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_TITLE,    curses.COLOR_CYAN,  -1)
+    curses.init_pair(C_HEADER,   curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_CURRENT,  curses.COLOR_GREEN,  -1)
+    curses.init_pair(C_SELECTED, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_HINT,     curses.COLOR_WHITE,  -1)
+    curses.init_pair(C_ERROR,    curses.COLOR_RED,    -1)
+    curses.init_pair(C_NORMAL,   -1,                  -1)
+
+
+def screen_select_slot(stdscr, settings):
+    """First screen: pick which slot to configure."""
+    curses.curs_set(0)
+    init_colors()
+    h, w = stdscr.getmaxyx()
+    idx = 0
+    n = len(SLOTS)
+
+    while True:
+        stdscr.clear()
+        title = "CLM - Claude Code Model Selector"
+        stdscr.addstr(0, (w - len(title)) // 2, title, curses.color_pair(C_TITLE) | curses.A_BOLD)
+
+        stdscr.addstr(2, 2, "Select model slot to configure:", curses.color_pair(C_HINT))
+        stdscr.addstr(3, 2, "-" * 40, curses.color_pair(C_HINT))
+
+        for i, (_, _, label, _) in enumerate(SLOTS):
+            val = get_val(settings, i)
+            y = 5 + i * 2
+            marker = " > " if i == idx else "   "
+            attr = curses.color_pair(C_SELECTED) | curses.A_BOLD if i == idx else curses.color_pair(C_NORMAL)
+            stdscr.addstr(y, 2, f"{marker}{label}", attr)
+            stdscr.addstr(y + 1, 6, f"current: {val or '(not set)'}",
+                          curses.color_pair(C_CURRENT) if i == idx else curses.color_pair(C_HINT))
+
+        foot = "Enter: select  |  q: quit"
+        stdscr.addstr(h - 2, (w - len(foot)) // 2, foot, curses.color_pair(C_HINT))
+
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (curses.KEY_UP, ord('k')) and idx > 0:
+            idx -= 1
+        elif ch in (curses.KEY_DOWN, ord('j')) and idx < n - 1:
+            idx += 1
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            return idx
+        elif ch in (ord('q'), 27):
+            return -1
+
+
+def screen_pick_model(stdscr, models, current, slot_label):
+    """Second screen: pick a model from the list."""
+    curses.curs_set(0)
+    init_colors()
+    h, w = stdscr.getmaxyx()
+
+    items = []
+    for header, mlist in group_models(models):
+        items.append((header, None))
+        for m in mlist:
+            items.append((m, m))
+
+    idx = 0
+    for i, (_, mid) in enumerate(items):
+        if mid == current:
+            idx = i
+            break
+
+    offset = 0
+    search = ""
+    searching = False
+
+    while True:
+        stdscr.clear()
+        usable_h = h - 4
+
+        if idx < offset:
+            offset = idx
+        elif idx >= offset + usable_h:
+            offset = idx - usable_h + 1
+
+        title = f"CLM > {slot_label}"
+        stdscr.addstr(0, (w - len(title)) // 2, title, curses.color_pair(C_TITLE) | curses.A_BOLD)
+        if current:
+            stdscr.addstr(1, 2, f"Current: {current}", curses.color_pair(C_CURRENT))
+
+        row = 2
+        for i in range(offset, min(len(items), offset + usable_h)):
+            text, mid = items[i]
+            is_header = mid is None
+            is_current = mid == current
+            is_selected = i == idx
+
+            if is_header:
+                attr = curses.color_pair(C_HEADER) | curses.A_BOLD
+                prefix = "  "
+            elif is_current:
+                attr = curses.color_pair(C_CURRENT)
+                prefix = " >> "
+            else:
+                attr = curses.color_pair(C_NORMAL)
+                prefix = "    "
+
+            if is_selected:
+                attr = curses.color_pair(C_SELECTED) | curses.A_BOLD
+                prefix = " > "
+
+            try:
+                stdscr.addstr(row, 2, f"{prefix}{text}", attr)
+            except curses.error:
+                pass
+            row += 1
+
+        if searching:
+            stdscr.addstr(h - 2, 2, f"/{search}_", curses.color_pair(C_TITLE))
+
+        foot = "Enter: select | /: search | Esc: back | q: quit"
+        stdscr.addstr(h - 1, (w - len(foot)) // 2, foot, curses.color_pair(C_HINT))
+
+        stdscr.refresh()
+        ch = stdscr.getch()
+
+        if ch == ord('/') and not searching:
+            searching = True
+            search = ""
+            continue
+
+        if searching:
+            if ch == 27:
+                searching = False
+                search = ""
+            elif ch in (curses.KEY_BACKSPACE, 127):
+                if search:
+                    search = search[:-1]
+                else:
+                    searching = False
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                searching = False
+                search = ""
+            elif 32 <= ch <= 126:
+                search += chr(ch)
+                for offset_i in range(len(items)):
+                    i = (idx + 1 + offset_i) % len(items)
+                    _, mid = items[i]
+                    if mid and search.lower() in mid.lower():
+                        idx = i
+                        break
+            continue
+
+        if ch in (curses.KEY_UP, ord('k')):
+            idx = max(0, idx - 1)
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            idx = min(len(items) - 1, idx + 1)
+        elif ch in (curses.KEY_PPAGE, 2):
+            idx = max(0, idx - usable_h)
+        elif ch in (curses.KEY_NPAGE, 6):
+            idx = min(len(items) - 1, idx + usable_h)
+        elif ch in (curses.KEY_HOME, 1):
+            idx = 0
+        elif ch in (curses.KEY_END, 5):
+            idx = len(items) - 1
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            _, mid = items[idx]
+            if mid:
+                return mid
+            for i in range(idx + 1, len(items)):
+                if items[i][1]:
+                    return items[i][1]
+            return None
+        elif ch in (ord('q'), 27):
+            return None
+
+
+def screen_error(stdscr, msg):
+    try:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(h // 2, (w - len(msg)) // 2, msg, curses.color_pair(C_ERROR) | curses.A_BOLD)
+        stdscr.addstr(h // 2 + 1, (w - 20) // 2, "Press any key...", curses.color_pair(C_HINT))
+        stdscr.refresh()
+        stdscr.getch()
+    except KeyboardInterrupt:
+        pass
+
+
+def tui_main(stdscr):
+    try:
+        settings = load()
+        models = fetch_models(settings)
+        if models is None:
+            screen_error(stdscr, "Cannot fetch models. Check ANTHROPIC_BASE_URL/AUTH_TOKEN.")
+            return
+        while True:
+            slot_idx = screen_select_slot(stdscr, settings)
+            if slot_idx < 0:
+                break
+            current = get_val(settings, slot_idx)
+            _, _, label, _ = SLOTS[slot_idx]
+            chosen = screen_pick_model(stdscr, models, current, label)
+            if chosen:
+                set_val(settings, slot_idx, chosen)
+                save(settings)
+    except KeyboardInterrupt:
+        pass
+
+
+# ── CLI mode (no TUI) ─────────────────────────────────────────────
+
+def cli_main():
+    args = sys.argv[1:]
+    if not args:
+        os.environ["ESCDELAY"] = "25"
+        curses.wrapper(tui_main)
+        return
+
+    if args[0] in ("--help", "-h"):
+        print("Usage: clm [model_id] [--opus [id]] [--sonnet [id]] [--haiku [id]] [--all]")
+        print()
+        print("  clm                  TUI model selector")
+        print("  clm cc/claude-opus-4-7     Set main model directly")
+        print("  clm --opus cc/claude-opus-4-7  Set opus directly")
+        print("  clm --sonnet combo-cheap   Set sonnet directly")
+        print("  clm --haiku cc/claude-haiku-4-5  Set haiku directly")
+        print("  clm -u, --uninstall        Remove clm")
+        return
+
+    if args[0] in ("--uninstall", "-u"):
+        exe = os.path.realpath(sys.argv[0])
+        if os.path.isfile(exe):
+            os.remove(exe)
+            print(f"Removed {exe}")
+        print("clm uninstalled.")
+        return
+
+    settings = load()
+    slots = []
+    val = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--all", "-a"):
+            slots = list(range(len(SLOTS)))
+        elif a in ("--opus", "--sonnet", "--haiku"):
+            idx = next(j for j, (n, *_) in enumerate(SLOTS) if n == a[2:])
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                val = args[i + 1]
+                i += 1
+            slots.append(idx)
+        elif not a.startswith("-"):
+            set_val(settings, 0, a)
+            save(settings)
+            print(f"Model -> {a}")
+            return
+        i += 1
+
+    if not slots:
+        slots = [0]
+
+    for si in slots:
+        if val and len(slots) == 1:
+            set_val(settings, si, val)
+            print(f"  {SLOTS[si][2]} -> {val}")
+        else:
+            print(f"  {SLOTS[si][2]}: {get_val(settings, si)}")
+    save(settings)
+    print("Saved.")
+
+
+if __name__ == "__main__":
+    cli_main()
