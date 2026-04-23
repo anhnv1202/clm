@@ -33,6 +33,10 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
+      - name: Install windows-curses (Windows only)
+        if: runner.os == 'Windows'
+        run: pip install windows-curses
+
       - name: Build (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
