@@ -21,6 +21,8 @@ SLOTS = [
     ("opus",   "ANTHROPIC_DEFAULT_OPUS_MODEL",    "Opus Default",  "env"),
     ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL",  "Sonnet Default","env"),
     ("haiku",  "ANTHROPIC_DEFAULT_HAIKU_MODEL",   "Haiku Default", "env"),
+    ("url",    "ANTHROPIC_BASE_URL",              "Base URL",      "env"),
+    ("token",  "ANTHROPIC_AUTH_TOKEN",            "Auth Token",    "env"),
 ]
 
 PROVIDER_NAMES = {
@@ -50,13 +52,32 @@ def safe_addstr(stdscr, y, x, text, attr=0):
     except curses.error:
         pass
 
+def _default_settings():
+    return {"model": "", "env": {}}
+
+
+def _ensure_shape(settings):
+    if not isinstance(settings, dict):
+        return _default_settings()
+    if "env" not in settings or not isinstance(settings.get("env"), dict):
+        settings["env"] = {}
+    return settings
+
+
 def load():
-    with open(SETTINGS_PATH) as f:
-        return json.load(f)
+    if not os.path.exists(SETTINGS_PATH):
+        return _default_settings()
+    try:
+        with open(SETTINGS_PATH) as f:
+            return _ensure_shape(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        return _default_settings()
+
 
 def save(s):
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
-        json.dump(s, f, indent=2)
+        json.dump(_ensure_shape(s), f, indent=2)
         f.write("\n")
 
 def get_val(s, idx):
@@ -76,10 +97,11 @@ def set_val(s, idx, val):
 # ── API ───────────────────────────────────────────────────────────
 
 def fetch_models(s):
-    base = s.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-    token = s.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    base = s.get("env", {}).get("ANTHROPIC_BASE_URL", "").strip()
+    token = s.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "").strip()
     if not base or not token:
-        return None
+        return None, "Base URL hoặc Auth Token chưa được thiết lập."
+
     url = f"{base.rstrip('/')}/models"
     hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -90,20 +112,43 @@ def fetch_models(s):
         env.pop("DYLD_LIBRARY_PATH", None)
         try:
             r = subprocess.run(
-                [curl, "-fsSL", "--max-time", "15",
+                [curl, "-sS", "--max-time", "15", "-w", "\n__HTTP_CODE__:%{http_code}",
                  "-H", hdrs["Authorization"], "-H", hdrs["Content-Type"], url],
                 capture_output=True, text=True, timeout=20, env=env)
-            if r.returncode == 0:
-                return _parse(json.loads(r.stdout))
+            if r.returncode == 0 and "__HTTP_CODE__:" in r.stdout:
+                body, code = r.stdout.rsplit("__HTTP_CODE__:", 1)
+                status = code.strip()
+                if status == "200":
+                    return _parse(json.loads(body)), None
+                if status in ("401", "403"):
+                    return None, "Auth Token không hợp lệ hoặc không có quyền truy cập model list."
+                return None, f"Fetch models thất bại (HTTP {status}). Kiểm tra lại Base URL và Auth Token."
+            if r.returncode == 28:
+                return None, "Kết nối tới Base URL bị timeout. Kiểm tra lại Base URL và mạng."
+        except subprocess.TimeoutExpired:
+            return None, "Kết nối tới Base URL bị timeout. Kiểm tra lại Base URL và mạng."
         except Exception:
             pass
 
     try:
         req = urllib.request.Request(url, headers={**hdrs, "User-Agent": "curl/8.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
-            return _parse(json.loads(r.read().decode()))
+            return _parse(json.loads(r.read().decode())), None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, "Auth Token không hợp lệ hoặc không có quyền truy cập model list."
+        return None, f"Fetch models thất bại (HTTP {e.code}). Kiểm tra lại Base URL và Auth Token."
     except Exception:
-        return None
+        return None, "Không thể fetch models. Kiểm tra lại Base URL và Auth Token."
+
+
+def fetch_models_or_msg(s):
+    models, err = fetch_models(s)
+    if err:
+        return None, err
+    if not models:
+        return None, "Không có model nào khả dụng từ endpoint /models."
+    return models, None
 
 def _parse(data):
     models = [m["id"] for m in data.get("data", [])]
@@ -149,10 +194,6 @@ def simple_select(items, current_idx=0):
 
 def simple_tui(_settings=None):
     settings = load()
-    models = fetch_models(settings)
-    if models is None:
-        print("Error: Cannot fetch models. Check settings.json")
-        return
     while True:
         print("\n=== CLM - Claude Code Model Selector ===\n")
         labels = [f"{label:16s} {get_val(settings, i) or '(not set)'}"
@@ -161,8 +202,26 @@ def simple_tui(_settings=None):
         if idx < 0:
             break
 
-        _, _, slot_label, _ = SLOTS[idx]
+        name, _, slot_label, _ = SLOTS[idx]
         current = get_val(settings, idx)
+
+        if name in ("url", "token"):
+            print(f"\n--- {slot_label} (current: {current or 'not set'}) ---")
+            try:
+                new_val = input("New value (Enter to keep, q to cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if new_val and new_val.lower() != "q":
+                set_val(settings, idx, new_val)
+                save(settings)
+                print(f"  {slot_label} -> {new_val}")
+            continue
+
+        models, err = fetch_models_or_msg(settings)
+        if err:
+            print(f"Error: {err}")
+            continue
+
         print(f"\n--- {slot_label} (current: {current or 'not set'}) ---\n")
 
         flat = []
@@ -366,27 +425,92 @@ def screen_pick_model(stdscr, models, current, slot_label):
             return None
 
 
+def screen_text_input(stdscr, label, current):
+    """Text input screen for URL/token. Returns new value or None."""
+    curses.curs_set(1)
+    init_colors()
+    h, w = stdscr.getmaxyx()
+    text = current or ""
+    cursor = len(text)
+
+    while True:
+        stdscr.clear()
+        title = f"CLM > {label}"
+        safe_addstr(stdscr, 0, max(0, (w - len(title)) // 2), title,
+                    curses.color_pair(C_TITLE) | curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, f"Current: {current or '(not set)'}",
+                    curses.color_pair(C_HINT))
+        safe_addstr(stdscr, 4, 2, "New value:", curses.color_pair(C_NORMAL))
+
+        # Input field
+        field_w = min(w - 6, 80)
+        safe_addstr(stdscr, 5, 4, text[:field_w], curses.color_pair(C_NORMAL))
+
+        # Cursor position
+        vis_pos = min(cursor, field_w)
+        try:
+            stdscr.move(5, 4 + vis_pos)
+        except curses.error:
+            pass
+
+        foot = "Enter: save | Esc: cancel"
+        safe_addstr(stdscr, h - 1, max(0, (w - len(foot)) // 2), foot,
+                    curses.color_pair(C_HINT))
+        stdscr.refresh()
+        ch = stdscr.getch()
+
+        if ch in (curses.KEY_ENTER, 10, 13):
+            return text
+        elif ch == 27:
+            return None
+        elif ch in (curses.KEY_BACKSPACE, 127):
+            if cursor > 0:
+                text = text[:cursor - 1] + text[cursor:]
+                cursor -= 1
+        elif ch == curses.KEY_DC:
+            if cursor < len(text):
+                text = text[:cursor] + text[cursor + 1:]
+        elif ch == curses.KEY_LEFT and cursor > 0:
+            cursor -= 1
+        elif ch == curses.KEY_RIGHT and cursor < len(text):
+            cursor += 1
+        elif ch == curses.KEY_HOME:
+            cursor = 0
+        elif ch == curses.KEY_END:
+            cursor = len(text)
+        elif 32 <= ch <= 126:
+            text = text[:cursor] + chr(ch) + text[cursor:]
+            cursor += 1
+
+
 def curses_tui(stdscr):
     try:
         settings = load()
-        models = fetch_models(settings)
-        if models is None:
-            h, w = stdscr.getmaxyx()
-            msg = "Cannot fetch models. Check settings.json"
-            safe_addstr(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg,
-                        curses.color_pair(C_ERROR) | curses.A_BOLD)
-            stdscr.getch()
-            return
         while True:
             slot_idx = screen_select_slot(stdscr, settings)
             if slot_idx < 0:
                 break
+            name, _, label, _ = SLOTS[slot_idx]
             current = get_val(settings, slot_idx)
-            _, _, label, _ = SLOTS[slot_idx]
-            chosen = screen_pick_model(stdscr, models, current, label)
-            if chosen:
-                set_val(settings, slot_idx, chosen)
-                save(settings)
+
+            if name in ("url", "token"):
+                result = screen_text_input(stdscr, label, current)
+                if result is not None and result != current:
+                    set_val(settings, slot_idx, result)
+                    save(settings)
+            else:
+                models, err = fetch_models_or_msg(settings)
+                if err:
+                    h, w = stdscr.getmaxyx()
+                    msg = err
+                    safe_addstr(stdscr, h // 2, max(0, (w - len(msg)) // 2), msg,
+                                curses.color_pair(C_ERROR) | curses.A_BOLD)
+                    stdscr.getch()
+                    continue
+                chosen = screen_pick_model(stdscr, models, current, label)
+                if chosen:
+                    set_val(settings, slot_idx, chosen)
+                    save(settings)
     except KeyboardInterrupt:
         pass
 
@@ -407,14 +531,16 @@ def cli_main():
         return
 
     if args[0] in ("--help", "-h"):
-        print("Usage: clm [model_id] [--opus [id]] [--sonnet [id]] [--haiku [id]] [--all]")
+        print("Usage: clm [model_id] [--opus [id]] [--sonnet [id]] [--haiku [id]] [--url <url>] [--token <token>] [--all]")
         print()
         print("  clm                  TUI model selector")
         print("  clm <model_id>       Set main model directly")
         print("  clm --opus [id]      Set opus default")
         print("  clm --sonnet [id]    Set sonnet default")
         print("  clm --haiku [id]     Set haiku default")
-        print("  clm --all            Set all slots")
+        print("  clm --url <url>      Set base URL")
+        print("  clm --token <token>  Set auth token")
+        print("  clm --all            Set all model slots")
         print("  clm -u               Uninstall")
         return
 
@@ -434,11 +560,16 @@ def cli_main():
         a = args[i]
         if a in ("--all", "-a"):
             slots = list(range(len(SLOTS)))
-        elif a in ("--opus", "--sonnet", "--haiku"):
+        elif a in ("--opus", "--sonnet", "--haiku", "--url", "--token"):
             idx = next(j for j, (n, *_) in enumerate(SLOTS) if n == a[2:])
+            slot_name = SLOTS[idx][0]
+            needs_value = slot_name in ("url", "token")
             if i + 1 < len(args) and not args[i + 1].startswith("-"):
                 val = args[i + 1]
                 i += 1
+            elif needs_value:
+                print(f"Error: {a} requires a value")
+                return
             slots.append(idx)
         elif not a.startswith("-"):
             set_val(settings, 0, a)
