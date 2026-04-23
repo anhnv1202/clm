@@ -77,11 +77,24 @@ mkdir -p "$BIN_DIR"
 
 echo "Downloading clm-${platform}..."
 
-if ! dl "$DEST" "$DOWNLOAD_URL"; then
+set +e
+dl "$DEST" "$DOWNLOAD_URL"
+dl_status=$?
+set -e
+
+if [ "$dl_status" -ne 0 ]; then
     echo ""
-    echo "Error: Binary for $platform not found." >&2
-    echo "Available platforms may differ. Check:" >&2
-    echo "  https://github.com/${REPO}/releases/${latest_tag}" >&2
+    if [ "$dl_status" -eq 23 ]; then
+        echo "Error: Download failed while writing to ${DEST}." >&2
+        echo "Check disk space and write permission for ${BIN_DIR}." >&2
+    elif [ "$dl_status" -eq 22 ] || [ "$dl_status" -eq 8 ]; then
+        echo "Error: Binary for $platform not found on release ${latest_tag}." >&2
+        echo "Available platforms may differ. Check:" >&2
+        echo "  https://github.com/${REPO}/releases/${latest_tag}" >&2
+    else
+        echo "Error: Download failed (code: $dl_status)." >&2
+        echo "URL: ${DOWNLOAD_URL}" >&2
+    fi
     exit 1
 fi
 
