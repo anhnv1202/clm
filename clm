@@ -178,11 +178,14 @@ def simple_select(items, current_idx=0):
         print(f"{marker} {i+1:3d}. {text}")
     print()
     try:
-        raw = input("Select (number, q=quit): ").strip()
+        raw = input("Select (number, e=nhập tay, q=quit): ").strip()
     except (EOFError, KeyboardInterrupt):
         return -1
-    if raw.lower() == "q":
+    low = raw.lower()
+    if low == "q":
         return -1
+    if low == "e":
+        return -2
     try:
         n = int(raw)
         if 1 <= n <= len(items):
@@ -232,6 +235,17 @@ def simple_tui(_settings=None):
         current_flat = current if current in flat else (flat[1] if len(flat) > 1 else None)
         current_idx = flat.index(current_flat) if current_flat in flat else 0
         chosen_idx = simple_select(flat, current_idx)
+
+        if chosen_idx == -2:
+            try:
+                manual = input("Nhập model ID: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if manual:
+                set_val(settings, idx, manual)
+                save(settings)
+                print(f"  {slot_label} -> {manual}")
+            continue
         if chosen_idx < 0:
             continue
 
@@ -368,7 +382,7 @@ def screen_pick_model(stdscr, models, current, slot_label):
             safe_addstr(stdscr, h - 2, 2, f"/{search}_",
                         curses.color_pair(C_TITLE))
 
-        foot = "Enter: select | /: search | Esc: back | q: quit"
+        foot = "Enter: select | e: nhập tay | /: search | Esc: back | q: quit"
         safe_addstr(stdscr, h - 1, max(0, (w - len(foot)) // 2), foot,
                     curses.color_pair(C_HINT))
         stdscr.refresh()
@@ -401,7 +415,12 @@ def screen_pick_model(stdscr, models, current, slot_label):
                         break
             continue
 
-        if ch in (curses.KEY_UP, ord('k')):
+        if ch == ord('e'):
+            manual = screen_text_input(stdscr, f"{slot_label} (nhập tay)", "")
+            if manual:
+                return manual
+            return None
+        elif ch in (curses.KEY_UP, ord('k')):
             idx = max(0, idx - 1)
         elif ch in (curses.KEY_DOWN, ord('j')):
             idx = min(len(items) - 1, idx + 1)
